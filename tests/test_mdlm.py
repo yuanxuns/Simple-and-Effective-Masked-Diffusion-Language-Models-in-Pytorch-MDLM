@@ -27,6 +27,14 @@ class DummyDenoiser(nn.Module):
         )
 
 
+class RecordingDenoiser(DummyDenoiser):
+    """Dummy denoiser that retains the continuous time coordinate it received."""
+
+    def forward(self, x_t, t):
+        self.last_time = t.detach().clone()
+        return super().forward(x_t, t)
+
+
 class MaskedDiffusionTest(unittest.TestCase):
     """Check shapes and invariants of forward, loss, and reverse processes."""
 
@@ -48,6 +56,17 @@ class MaskedDiffusionTest(unittest.TestCase):
 
         expected = torch.tensor([[0, 1], [2, self.mask_id], [self.mask_id, self.mask_id]])
         self.assertTrue(torch.equal(x_t, expected))
+
+    def test_model_uses_loglinear_noise_conditioning(self):
+        """Masking time ``t`` is converted to ``sigma=-log(1-t)`` for DiT."""
+        model = RecordingDenoiser(self.k + 1)
+        x_t = torch.full((3, 2), self.mask_id)
+        t = torch.tensor([0.0, 0.5, 1.0])
+
+        self.diffusion.model_x_start_logits(model, x_t, t)
+
+        expected = -torch.log1p(-t.clamp(max=1.0 - self.diffusion.eps))
+        self.assertTrue(torch.allclose(model.last_time, expected))
 
     def test_subs_logits_masks_and_freezes(self):
         """SUBS disables mask predictions and freezes unmasked ``(B, L)`` values."""

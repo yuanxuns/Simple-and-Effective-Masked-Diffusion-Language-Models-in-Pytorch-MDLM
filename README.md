@@ -31,8 +31,9 @@ The validation BPD is a likelihood estimate for the MDLM, so it does not vary
 with the sampling-step count. The 64/128/256 comparison measures generated text
 and NFE; `report.json` repeats the same validation BPD in each row to make this
 explicit. The AR comparison uses teacher-forced BPC and requires 255 sequential
-model calls for a 256-character sample (without a KV cache), while MDLM needs
-64, 128, or 256 calls respectively.
+model calls for a 256-character sample, but now caches the K/V tensors of every
+layer: after the one-token prefix prefill, each call processes only one new token.
+MDLM needs 64, 128, or 256 full-sequence calls respectively.
 
 ## References
 

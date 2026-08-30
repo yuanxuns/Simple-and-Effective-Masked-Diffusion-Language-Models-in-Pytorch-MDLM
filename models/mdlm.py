@@ -135,10 +135,17 @@ class MaskedDiffusion(nn.Module):
 
     # === SUBS Parametrization ===
     def model_x_start_logits(self, model, x_t, t):
-        """Call the denoiser and return raw logits of shape ``(B, *data_shape, V)``."""
+        """Call the denoiser with log-linear noise conditioning.
+
+        ``t`` is the masking probability, while the denoiser receives
+        ``sigma(t) = -log(1-t)`` of shape ``(B,)``. This is the log-linear
+        continuous-time coordinate used by the SUBS MDLM objective.
+        """
         t = self._as_continuous(t)
         if self.time_conditioning:
-            t_net = t * self.time_conditioning
+            # Clamp only at sampling's exact t=1 endpoint, where sigma is
+            # infinite but x_t is already the all-mask prior.
+            t_net = -torch.log1p(-t.clamp(min=0.0, max=1.0 - self.eps))
         else:
             t_net = torch.zeros_like(t)
         return model(x_t, t_net)

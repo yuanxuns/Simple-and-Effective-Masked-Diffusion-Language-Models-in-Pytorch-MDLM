@@ -4,6 +4,26 @@ import math
 
 import torch
 from torch import nn
+from torch.nn import functional as F
+
+
+def sinusoidal_timestep_embedding(timesteps, dim, max_period=10_000):
+    """Embed continuous or discrete times into Fourier features.
+
+    Args:
+        timesteps: Floating time coordinates of shape ``(B,)``.
+        dim: Feature width ``D``.
+
+    Returns:
+        Sinusoidal features of shape ``(B, D)``.
+    """
+    half = dim // 2
+    frequencies = torch.exp(
+        -math.log(max_period) * torch.arange(half, device=timesteps.device) / max(half, 1)
+    )
+    angles = timesteps.float()[:, None] * frequencies[None]  # (B, 1) * (1, D/2)
+    embedding = torch.cat((torch.cos(angles), torch.sin(angles)), dim=-1)
+    return F.pad(embedding, (0, dim % 2)) if dim % 2 else embedding
 
 
 class DiTBlock(nn.Module):
@@ -17,19 +37,39 @@ class DiTBlock(nn.Module):
         Updated token features with shape ``(B, N, D)``.
     """
 
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, dropout=0.1):
         super().__init__()
+        if (hidden_size // num_heads) % 2:
+            raise ValueError("Each attention head dimension must be even for RoPE.")
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False)
-        self.attn = nn.MultiheadAttention(
-            hidden_size, num_heads, batch_first=True
-        )
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.qkv = nn.Linear(hidden_size, 3 * hidden_size, bias=False)
+        self.attn_out = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.attn_dropout = float(dropout)
+        self.residual_dropout = nn.Dropout(dropout)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False)
         self.mlp = nn.Sequential(
             nn.Linear(hidden_size, int(hidden_size * mlp_ratio)),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(int(hidden_size * mlp_ratio), hidden_size),
+            nn.Dropout(dropout),
         )
         self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(hidden_size, 4 * hidden_size))
+
+    def _apply_rope(self, q_or_k):
+        """Apply rotary position encoding to ``(B, H, N, Dh)`` queries or keys."""
+        length = q_or_k.shape[2]
+        half = self.head_dim // 2
+        positions = torch.arange(length, device=q_or_k.device, dtype=torch.float32)
+        frequencies = torch.exp(
+            -math.log(10_000) * torch.arange(half, device=q_or_k.device, dtype=torch.float32) / half
+        )
+        angles = positions[:, None] * frequencies[None, :]
+        cos, sin = angles.cos().to(q_or_k.dtype)[None, None], angles.sin().to(q_or_k.dtype)[None, None]
+        first, second = q_or_k[..., :half], q_or_k[..., half:]
+        return torch.cat((first * cos - second * sin, first * sin + second * cos), dim=-1)
 
     def forward(self, x, cond):
         """Apply the block.
@@ -44,7 +84,17 @@ class DiTBlock(nn.Module):
         shift1, scale1, shift2, scale2 = self.modulation(cond).chunk(4, dim=-1)
         # (B, D) -> (B, 1, D), broadcast over N tokens: (B, N, D).
         h = self.norm1(x) * (1 + scale1[:, None]) + shift1[:, None]
-        x = x + self.attn(h, h, h, need_weights=False)[0]
+        batch_size, length, _ = h.shape
+        qkv = self.qkv(h).view(batch_size, length, 3, self.num_heads, self.head_dim)
+        q, k, v = qkv.unbind(dim=2)
+        # (B, N, H, Dh) -> (B, H, N, Dh); RoPE preserves this shape.
+        q, k, v = (tensor.transpose(1, 2) for tensor in (q, k, v))
+        q, k = self._apply_rope(q), self._apply_rope(k)
+        attention = F.scaled_dot_product_attention(
+            q, k, v, dropout_p=self.attn_dropout if self.training else 0.0
+        )
+        attention = attention.transpose(1, 2).reshape(batch_size, length, -1)
+        x = x + self.residual_dropout(self.attn_out(attention))
         # Attention preserves token count, so x and h remain (B, N, D).
         h = self.norm2(x) * (1 + scale2[:, None]) + shift2[:, None]
         return x + self.mlp(h)
@@ -64,16 +114,18 @@ class DiT(nn.Module):
         num_timesteps: Number of diffusion timesteps ``T``.
         hidden_size: Transformer token width ``D``.
         depth: Number of DiT blocks.
-        num_heads: Number of attention heads; must divide ``hidden_size``.
+        num_heads: Number of attention heads; must divide ``hidden_size`` and
+            leave an even per-head width for RoPE.
+        dropout: Attention and MLP dropout probability during training.
         condition_classes: Number of labels. ``None`` makes the model unconditional.
         class_dropout_prob: Probability of replacing a label with the learned null
             label during training, enabling classifier-free guidance.
 
     Inputs:
         ``x`` has shape ``(B, *input_shape)`` with integer values in ``[0, K-1]``.
-        ``t`` has shape ``(B,)``. It may contain continuous diffusion times in
-        ``[0, 1]`` or integer indices in ``[0, T-1]``. Optional ``y`` has shape
-        ``(B,)``.
+        ``t`` has shape ``(B,)`` and contains continuous log-noise levels
+        ``sigma=-log(1-t_mask)`` (or integer indices in ``[0, T-1]``). Optional
+        ``y`` has shape ``(B,)``.
 
     Output:
         Tensor of shape ``(B, *input_shape, K)`` containing clean-state logits.
@@ -82,6 +134,7 @@ class DiT(nn.Module):
     def __init__(
         self, input_shape, num_classes, num_timesteps, hidden_size=192,
         depth=6, num_heads=6, condition_classes=None, class_dropout_prob=0.1,
+        dropout=0.1,
     ):
         super().__init__()
         if hidden_size % num_heads:
@@ -92,25 +145,29 @@ class DiT(nn.Module):
         self.condition_classes = condition_classes
         self.class_dropout_prob = class_dropout_prob
         self.token_embed = nn.Embedding(num_classes, hidden_size)
-        self.position_embed = nn.Parameter(torch.zeros(1, self.num_tokens, hidden_size))
-        self.time_embed = nn.Embedding(num_timesteps, hidden_size)
+        self.num_timesteps = int(num_timesteps)
+        # Continuous Fourier features avoid sparsely-trained discrete time bins.
+        self.time_embed = nn.Sequential(
+            nn.Linear(hidden_size, 4 * hidden_size),
+            nn.SiLU(),
+            nn.Linear(4 * hidden_size, hidden_size),
+        )
         self.class_embed = (
             nn.Embedding(condition_classes + 1, hidden_size)
             if condition_classes is not None else None
         )
         self.blocks = nn.ModuleList(
-            [DiTBlock(hidden_size, num_heads) for _ in range(depth)]
+            [DiTBlock(hidden_size, num_heads, dropout=dropout) for _ in range(depth)]
         )
         self.norm = nn.LayerNorm(hidden_size)
         self.head = nn.Linear(hidden_size, num_classes)
-        nn.init.normal_(self.position_embed, std=0.02)
 
     def _forward_logits(self, x, t, y):
         """Predict logits for one fixed conditioning assignment.
 
         Args:
             x: Integer noisy-state tensor of shape ``(B, *input_shape)``.
-            t: Continuous ``(B,)`` time in ``[0, 1]`` or integer timestep index.
+            t: Continuous log-noise tensor ``(B,)`` or integer timestep index.
             y: Class-label tensor of shape ``(B,)`` or ``None``.
 
         Returns:
@@ -118,14 +175,15 @@ class DiT(nn.Module):
         """
         # Flatten data axes: (B, *input_shape) -> (B, N), then embed -> (B, N, D).
         tokens = self.token_embed(x.long().reshape(x.shape[0], self.num_tokens))
-        # MDLM supplies continuous times. Quantize only for the learned lookup table.
+        # MDLM supplies continuous log-noise sigma. Fourier features retain its
+        # full high-noise resolution: (B,) -> (B, D) -> (B, D).
         if torch.is_floating_point(t):
-            t_index = (t.clamp(0, 1) * (self.time_embed.num_embeddings - 1)).round().long()
+            t_coordinate = t
         else:
-            t_index = t.long()
-        if bool(((t_index < 0) | (t_index >= self.time_embed.num_embeddings)).any()):
-            raise ValueError("timestep indices must be in [0, num_timesteps - 1].")
-        cond = self.time_embed(t_index)  # (B,) -> (B, D)
+            t_coordinate = t.float()
+        if bool((~torch.isfinite(t_coordinate) | (t_coordinate < 0)).any()):
+            raise ValueError("time coordinates must be finite and non-negative.")
+        cond = self.time_embed(sinusoidal_timestep_embedding(t_coordinate, tokens.shape[-1]))
         if self.class_embed is not None:
             if y is None:
                 y = torch.full_like(t, self.condition_classes)
@@ -136,7 +194,8 @@ class DiT(nn.Module):
                 dropped = torch.rand_like(y, dtype=torch.float) < self.class_dropout_prob
                 y = torch.where(dropped, torch.full_like(y, self.condition_classes), y)
             cond = cond + self.class_embed(y)
-        h = tokens + self.position_embed  # (B, N, D) + (1, N, D) -> (B, N, D)
+        # Positional information is injected into attention queries/keys by RoPE.
+        h = tokens  # (B, N, D)
         for block in self.blocks:
             h = block(h, cond)
         logits = self.head(self.norm(h))  # (B, N, D) -> (B, N, K)
@@ -147,7 +206,7 @@ class DiT(nn.Module):
 
         Args:
             x: Integer noisy-state tensor of shape ``(B, *input_shape)``.
-            t: Continuous ``(B,)`` time in ``[0, 1]`` or integer timestep index.
+            t: Continuous log-noise tensor ``(B,)`` or integer timestep index.
             y: Optional class-label tensor of shape ``(B,)``.
             cfg_scale: Classifier-free guidance scale. ``1.0`` uses ordinary
                 conditional logits; ``0.0`` uses null-label logits; values above

@@ -9,6 +9,7 @@ TensorBoard logs, checkpoints, samples, and ``report.json`` are written below
 """
 
 import argparse
+import copy
 import json
 import random
 import sys
@@ -47,6 +48,7 @@ def parse_args():
     parser.add_argument("--hidden-size", type=int, default=384)
     parser.add_argument("--depth", type=int, default=8)
     parser.add_argument("--num-heads", type=int, default=6)
+    parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--ar-hidden-size", type=int, default=None,
                         help="AR width; use 448 with the default MDLM to match parameters.")
     parser.add_argument("--ar-depth", type=int, default=None)
@@ -58,8 +60,11 @@ def parse_args():
     parser.add_argument("--eval-every", type=int, default=2_000)
     parser.add_argument("--eval-batches", type=int, default=8)
     parser.add_argument("--bpd-steps", type=int, default=64)
+    parser.add_argument("--time-bin-eval-batches", type=int, default=2,
+                        help="Validation batches per noise-time diagnostic bin.")
     parser.add_argument("--sample-batch-size", type=int, default=4)
     parser.add_argument("--precision", choices=("fp32", "fp16", "bf16"), default="bf16")
+    parser.add_argument("--ema-decay", type=float, default=0.9999)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--download-only", action="store_true")
     return parser.parse_args()
@@ -108,6 +113,15 @@ def count_parameters(model):
     return sum(parameter.numel() for parameter in model.parameters())
 
 
+@torch.no_grad()
+def update_ema(ema_model, model, decay):
+    """Update EMA weights after an optimizer step without tracking gradients."""
+    for ema_parameter, parameter in zip(ema_model.parameters(), model.parameters()):
+        ema_parameter.lerp_(parameter, 1.0 - decay)
+    for ema_buffer, buffer in zip(ema_model.buffers(), model.buffers()):
+        ema_buffer.copy_(buffer)
+
+
 def lr_for_step(step, args):
     """Linear warmup followed by cosine decay to 10% of the peak LR."""
     if step < args.warmup_steps:
@@ -140,6 +154,27 @@ def evaluate_ar(model, valid_tokens, args, device):
 
 
 @torch.no_grad()
+def evaluate_mdlm_time_bins(model, diffusion, valid_tokens, args, device):
+    """Estimate weighted MDLM BPD in four continuous-time intervals.
+
+    Each value has the same per-position BPD units as the training objective but
+    is conditioned on one interval of ``t``. Their relative values diagnose
+    whether failure is concentrated in nearly-clean or nearly-all-mask inputs.
+    """
+    model.eval()
+    bins = ((0.0, 0.25), (0.25, 0.5), (0.5, 0.75), (0.75, 1.0))
+    results = {}
+    for low, high in bins:
+        values = []
+        for _ in range(args.time_bin_eval_batches):
+            x = random_batch(valid_tokens, args.batch_size, args.seq_len, device)
+            t = torch.empty(args.batch_size, device=device).uniform_(max(low, diffusion.eps), high)
+            values.append(diffusion._nelbo_bpd_terms(model, x, t).mean())
+        results[f"{int(low * 100)}_{int(high * 100)}"] = torch.stack(values).mean().item()
+    return results
+
+
+@torch.no_grad()
 def sample_and_log(mdlm, diffusion, ar_model, step, writer, run_dir, args, device):
     """Generate MDLM samples at 64/128/256 steps and AR samples, then log NFE."""
     mdlm.eval()
@@ -161,10 +196,10 @@ def sample_and_log(mdlm, diffusion, ar_model, step, writer, run_dir, args, devic
     ar_samples = ar_model.generate(prefix, args.seq_len - 1)
     ar_text = "\n---\n".join(decode(row.cpu()) for row in ar_samples)
     writer.add_text("samples/ar", ar_text, step)
-    writer.add_scalar("sampling/ar_nfe", args.seq_len - 1, step)
-    lines.extend((f"AR NFE={args.seq_len - 1}", ar_text))
+    writer.add_scalar("sampling/ar_nfe", ar_model.last_nfe, step)
+    lines.extend((f"AR NFE={ar_model.last_nfe} (KV cache enabled)", ar_text))
     (run_dir / f"samples_step_{step:07d}.txt").write_text("\n\n".join(lines))
-    return sampling_nfe
+    return sampling_nfe, ar_model.last_nfe
 
 
 def main():
@@ -189,7 +224,12 @@ def main():
         num_timesteps=args.diffusion_steps, bpd_num_steps=args.bpd_steps,
     ).to(device)
     mdlm = DiT((args.seq_len,), vocab_size + 1, args.diffusion_steps,
-               hidden_size=args.hidden_size, depth=args.depth, num_heads=args.num_heads).to(device)
+               hidden_size=args.hidden_size, depth=args.depth, num_heads=args.num_heads,
+               dropout=args.dropout).to(device)
+    # EMA is used only for validation and sampling; the online model receives gradients.
+    mdlm_ema = copy.deepcopy(mdlm).eval()
+    for parameter in mdlm_ema.parameters():
+        parameter.requires_grad_(False)
     ar_model = CausalTransformerLM(
         vocab_size, args.seq_len,
         hidden_size=args.ar_hidden_size or args.hidden_size,
@@ -204,6 +244,8 @@ def main():
     print(f"MDLM parameters: {count_parameters(mdlm):,}; AR parameters: {count_parameters(ar_model):,}")
 
     for step in range(1, args.steps + 1):
+        mdlm.train()
+        ar_model.train()
         lr = lr_for_step(step - 1, args)
         for optimizer in (mdlm_optim, ar_optim):
             for group in optimizer.param_groups:
@@ -226,21 +268,29 @@ def main():
             torch.nn.utils.clip_grad_norm_(optimizer.param_groups[0]["params"], 1.0)
             scaler.step(optimizer)
         scaler.update()
+        # Warm up EMA so early validation is not dominated by the random init.
+        ema_decay = min(args.ema_decay, (step + 1) / (step + 10))
+        update_ema(mdlm_ema, mdlm, ema_decay)
         writer.add_scalar("train/mdlm_bpd", mdlm_loss, step)
         writer.add_scalar("train/ar_bpc", ar_loss / torch.log(torch.tensor(2.0)).item(), step)
         writer.add_scalar("train/lr", lr, step)
 
         if step % args.eval_every == 0 or step == args.steps:
-            mdlm_bpd = evaluate_mdlm(mdlm, diffusion, valid_tokens, args, device)
+            mdlm_bpd = evaluate_mdlm(mdlm_ema, diffusion, valid_tokens, args, device)
             ar_bpc = evaluate_ar(ar_model, valid_tokens, args, device)
+            time_bin_bpd = evaluate_mdlm_time_bins(mdlm_ema, diffusion, valid_tokens, args, device)
             writer.add_scalar("validation/mdlm_bpd", mdlm_bpd, step)
             writer.add_scalar("validation/ar_bpc", ar_bpc, step)
-            sampling_nfe = sample_and_log(
-                mdlm, diffusion, ar_model, step, writer, args.run_dir, args, device
+            for time_bin, value in time_bin_bpd.items():
+                writer.add_scalar(f"validation/mdlm_bpd_t_{time_bin}", value, step)
+            sampling_nfe, ar_sampling_nfe = sample_and_log(
+                mdlm_ema, diffusion, ar_model, step, writer, args.run_dir, args, device
             )
             report = {
                 "step": step, "validation_mdlm_bpd": mdlm_bpd,
                 "validation_ar_bpc": ar_bpc,
+                "validation_mdlm_bpd_by_t": time_bin_bpd,
+                "ema_decay": args.ema_decay,
                 "mdlm_parameters": count_parameters(mdlm), "ar_parameters": count_parameters(ar_model),
                 # Likelihood/BPD is a property of the trained MDLM and does not
                 # change with the reverse-sampling discretization. It is repeated
@@ -249,10 +299,11 @@ def main():
                     sample_steps: {**values, "validation_bpd": mdlm_bpd}
                     for sample_steps, values in sampling_nfe.items()
                 },
-                "ar_sampling_nfe": args.seq_len - 1,
+                "ar_sampling_nfe": ar_sampling_nfe,
+                "ar_kv_cache": True,
             }
             (args.run_dir / "report.json").write_text(json.dumps(report, indent=2) + "\n")
-            torch.save({"step": step, "mdlm": mdlm.state_dict(), "ar": ar_model.state_dict(),
+            torch.save({"step": step, "mdlm": mdlm.state_dict(), "mdlm_ema": mdlm_ema.state_dict(), "ar": ar_model.state_dict(),
                         "args": vars(args)}, args.run_dir / "checkpoint.pt")
             print(json.dumps(report))
     writer.close()
