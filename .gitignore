@@ -219,4 +219,5 @@ __marimo__/
 
 artifacts/*
 data/*
+runs/*
 pytest.ini

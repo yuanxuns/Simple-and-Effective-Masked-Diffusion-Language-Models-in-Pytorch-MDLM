@@ -461,6 +461,7 @@ def build_maksed_diffusion(
     """
     if mask_id != K:
         raise ValueError("build_maksed_diffusion requires mask_id == K.")
+    V = K + 1 if V is None else V
     if V is not None and V != K + 1:
         raise ValueError("V, when supplied, must equal K+1.")
     return MaskedDiffusion(
